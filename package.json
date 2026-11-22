@@ -1,6 +1,6 @@
 {
   "name": "davinci-console-demo",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "private": false,
   "description": "[DEMO] dsh-davinci-console-demo（npm: davinci-console-demo）— 视觉驱动的 Vibe Color：DeepSeek-V4.1-Flash 多帧理解、V-Log 技术转换、独立风格节点、前后复看与客观画质检查；DaVinci Resolve DSH 插件。",
   "type": "module",

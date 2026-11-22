@@ -1,4 +1,4 @@
-# dsh-davinci-console-demo（0.14.0 · DEMO）
+# dsh-davinci-console-demo（0.14.1 · DEMO）
 
 ![npm](https://img.shields.io/npm/v/davinci-console-demo?label=npm)
 ![demo](https://img.shields.io/badge/status-DEMO-orange)
@@ -7,7 +7,7 @@
 
 dsh-davinci-console-demo 是 DaVinci Resolve 的调色 / 剪辑控制台，作为 DSH Web 插件运行（npm 安装名仍为 `davinci-console-demo`）：在浏览器面板里完成「素材 → 还原 → 调色/风格 → 交付」的完整流程，所有动作通过 **Resolve MCP** 驱动本机 DaVinci Resolve Studio。
 
-> ⚠️ 这是 **Demo 版（0.14.0）**：核心链路已可用，擦除（erase）等实验功能明确标记 DEMO/禁用；请在真实交付前自行复核画面。
+> ⚠️ 这是 **Demo 版（0.14.1）**：核心链路已可用，擦除（erase）等实验功能明确标记 DEMO/禁用；请在真实交付前自行复核画面。
 
 ## 功能
 
@@ -37,14 +37,14 @@ dsh-davinci-console-demo 是 DaVinci Resolve 的调色 / 剪辑控制台，作�
 
 ```bash
 # DSH 市场/包安装
-npm install davinci-console-demo@0.14.0
+npm install davinci-console-demo@0.14.1
 # 或在 DSH 的插件管理中按包名安装后启用
 ```
 
 ### DSH 插件市场引导
 - 市场索引：<https://github.com/JiangXingchen4210/dsh-davinci-console-demo/blob/main/market-index.json>
 - 收录材料：[MARKET_SUBMISSION.md](./MARKET_SUBMISSION.md)、[MARKET_SUBMISSION_EMAIL.md](./MARKET_SUBMISSION_EMAIL.md)
-- 包名：`davinci-console-demo@0.14.0`（本版本通过 GitHub Actions + npm Trusted Publisher 发布，带 provenance）
+- 包名：`davinci-console-demo@0.14.1`（本版本通过 GitHub Actions + npm Trusted Publisher 发布，带 provenance）
 
 ## 使用（三步）
 
@@ -56,7 +56,7 @@ npm install davinci-console-demo@0.14.0
 
 ## 版本
 
-- 0.14.0（Demo）：Vibe Color 单入口；Panasonic 私有元数据 V-Log 识别；片段级 Input Color Space 审计/修正；LUT 输入域校验；镜头亮度匹配；独立风格节点
+- 0.14.1（Demo）：Vibe Color 单入口；Panasonic 私有元数据 V-Log 识别；片段级 Input Color Space 审计/修正；LUT 输入域校验；镜头亮度匹配；独立风格节点
 - 0.11.0（Demo）：还原决策链路、15 节点图、风格库、交付审批、调试日志、依赖自检、内置 LUT 支持库（清单随包，LUT 本体因授权不随包发布）
 
 ## License

@@ -20,8 +20,8 @@
     {
       "name": "davinci-console-demo",
       "description": {
-        "zh": "dsh-davinci-console-demo（DEMO 0.14.0）：Vibe Color 由 DeepSeek-V4.1-Flash 看多个时间点画面后给场景/问题/调色方案，V-Log 技术转换与 Node1 保护，独立风格节点，前后配对复看，裁切/溢色/断层客观检查；视觉失败明确未完成。需要 macOS + Resolve Studio + Resolve MCP + ffmpeg。",
-        "en": "dsh-davinci-console-demo (DEMO 0.14.0): Vibe Color lets DeepSeek-V4.1-Flash inspect multiple timestamped frames, then plans scene issues and color moves; V-Log technical transform with Node1 protection, independent style node, paired before/after review, clipping/spill/banding checks; vision failure is reported as incomplete. Requires macOS + Resolve Studio + Resolve MCP + ffmpeg."
+        "zh": "dsh-davinci-console-demo（DEMO 0.14.1）：Vibe Color 由 DeepSeek-V4.1-Flash 看多个时间点画面后给场景/问题/调色方案，V-Log 技术转换与 Node1 保护，独立风格节点，前后配对复看，裁切/溢色/断层客观检查；视觉失败明确未完成。需要 macOS + Resolve Studio + Resolve MCP + ffmpeg。",
+        "en": "dsh-davinci-console-demo (DEMO 0.14.1): Vibe Color lets DeepSeek-V4.1-Flash inspect multiple timestamped frames, then plans scene issues and color moves; V-Log technical transform with Node1 protection, independent style node, paired before/after review, clipping/spill/banding checks; vision failure is reported as incomplete. Requires macOS + Resolve Studio + Resolve MCP + ffmpeg."
       },
       "homepage": "https://github.com/JiangXingchen4210/dsh-davinci-console-demo",
       "repository": {
@@ -43,7 +43,7 @@
       },
       "versions": [
         {
-          "version": "0.14.0",
+          "version": "0.14.1",
           "publishTimestamp": 1795380585,
           "engines": {
             "dsh": ">=0.2.2-rc.1"

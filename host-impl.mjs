@@ -3236,6 +3236,7 @@ async function opVibeVision(ctx, args, signal) {
   if (plannedOnly) {
     return {
       ok: true,
+      callOk: true,
       stage: 'planned',
       complete: false,
       acceptance: 'planned',
@@ -3253,12 +3254,13 @@ async function opVibeVision(ctx, args, signal) {
   const objectiveFailed = results.some((row) => (row.objectiveFlags ?? []).length > 0)
   const verdicts = results.map((row) => ({ itemId: row.itemId, verdict: row.review?.verdict ?? null, confidence: row.review?.confidence ?? null }))
   const unverified = [...new Set(results.flatMap((row) => row.metrics?.after?.aggregate?.unverifiedChecks ?? row.metrics?.after?.unverifiedChecks ?? []))]
+  const callOk = results.every((row) => row.applied?.ok === true && row.review?.skipped !== true && !row.review?.error)
   const complete = technicalOk && reviewOk && !localRequested && !objectiveFailed && unverified.length === 0
   const ok = complete
   const stage = !technicalOk ? 'technical-failed' : !reviewOk ? 'review-not-passed' : localRequested ? 'local-unsupported' : objectiveFailed ? 'objective-failed' : 'checks-unverified'
   return {
     ok,
-    callOk: reviewOk,
+    callOk,
     acceptance: complete ? 'passed' : 'partial',
     acceptanceReason: complete ? null : (!technicalOk ? 'technical-failed' : (unverified.length ? 'unverified-checks' : (localRequested ? 'local-not-applied' : (objectiveFailed ? 'objective-failed' : 'review-not-passed')))),
     stage,
@@ -7764,7 +7766,7 @@ async function opFeedbackIssue(ctx, args, signal) {
     '',
     '### 环境',
     '```json',
-    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.14.0' }, null, 2),
+    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.14.1' }, null, 2),
     '```',
     '',
     '### 调试日志（最近）',
