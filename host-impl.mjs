@@ -2548,16 +2548,19 @@ async function sampleSourceStats(ctx, signal, info, fps) {
 /** 识别当前片段/指定片段的相机、传输函数，以及“要不要套 LUT”。 */
 /** 相机 LOG 自动还原：识别机型 → 生成/安装对应 LUT → 套到片段节点上（考试/日常都用这个）。 */
 async function opCameraFix(ctx, args, signal) {
-  const { item, info } = await resolveItemContext(ctx, signal, args.itemId)
+  const { item, info, clipProperties } = await resolveItemContext(ctx, signal, args.itemId)
   const { detectCamera } = await importFresh('lib/camera.mjs')
   // 必须用**源素材**判 LOG（渲染帧已经带调色，会把 Log 判成已调色）
   const sourceFrame = await exportSourceFrame(ctx, signal, item.id)
   if (!sourceFrame?.path) throw new Error('抓不到源素材帧，无法判断是否 LOG')
   const stats = await layersCli(['analyze', sourceFrame.path])
-  const tagsText = await mediaTagsText(info.filePath)
-  const detection = detectCamera({ filePath: info.filePath, name: `${info.name} ${tagsText}`, stats })
+  const ffprobe = await ffprobeJson(info.filePath).catch(() => null)
+  const detection = detectCamera({ filePath: info.filePath, ffprobe, clipProperties, stats })
   // 文件名里没有机型时（如 A007C####），允许调用方指定机型/Log，避免"识别不到就干不了"
   const forced = typeof args.cameraKey === 'string' && args.cameraKey.trim() ? args.cameraKey.trim() : null
+  if (!forced && detection.isLog === true && detection.confidence < 0.8) {
+    return { ok: false, applied: false, detection, error: 'LOG 曲线证据不足；请确认拍摄 Gamma 后指定 cameraKey' }
+  }
   const lutKey = forced ? (forced.endsWith('-to-rec709') ? forced : `${forced}-to-rec709`.replace('-to-rec709-to-rec709', '-to-rec709')) : detection.suggested.lutKey
   if (!forced && !detection.needsLut) return { ok: true, applied: false, detection, reason: detection.reason, hint: '文件名无机型信息时，传 cameraKey（如 dji-dlog / sony-slog3 / arri-logc3）指定 LOG' }
   const resolvedLut = await opLutEnsure(ctx, { name: (lutKey ?? '').replace('-to-rec709', '') || forced }, signal)
@@ -2650,7 +2653,7 @@ async function opInputAudit(ctx, args, signal) {
         : null
       const beforeValue = before?.ok ? (before.value?.properties ?? before.value ?? null) : null
       const detection = await opCameraDetect(ctx, { itemId: item.id }, signal)
-      const target = detection?.detection?.isLog && detection?.detection?.suggested?.inputColorSpace
+      const target = detection?.detection?.isLog && detection?.detection?.confidence >= 0.8 && detection?.detection?.suggested?.inputColorSpace
         ? String(detection.detection.suggested.inputColorSpace)
         : null
       let written = null
@@ -2660,6 +2663,9 @@ async function opInputAudit(ctx, args, signal) {
         const after = await settle(callTool(ctx, 'media_pool_item', { action: 'get_clip_property', params: { clip_id: clipId, key: 'Input Color Space' } }, signal))
         afterValue = after?.ok ? (after.value?.properties ?? after.value ?? null) : null
       }
+      const verified = !managed || (detection?.detection?.isLog === false
+        ? true
+        : Boolean(target) && String(afterValue ?? '').trim() === target)
       rows.push({
         itemId: item.id,
         name: item.name,
@@ -2672,14 +2678,17 @@ async function opInputAudit(ctx, args, signal) {
         beforeInputColorSpace: beforeValue,
         afterInputColorSpace: afterValue,
         written: Boolean(written?.ok && written.value?.success !== false),
-        writeError: written && !written.ok ? messageOf(written.error) : null,
+        verified,
+        writeError: written && !written.ok ? messageOf(written.error)
+          : written && written.value?.success === false ? 'Resolve 拒绝写入 Input Color Space'
+          : !verified && args.fix === true ? `Input Color Space 未确认：期望 ${target ?? '待识别'}，实际 ${afterValue}` : null,
       })
     } catch (error) {
       rows.push({ itemId: item.id, name: item.name, error: messageOf(error) })
     }
   }
   return {
-    ok: rows.every((row) => !row.error),
+    ok: rows.every((row) => !row.error && (args.fix !== true || !managed || row.verified)),
     project: { mode: settings.colorScienceMode ?? null, input: settings.colorSpaceInput ?? null, managed },
     trackIndex,
     fix: args.fix === true,
@@ -2894,21 +2903,29 @@ async function opVibeApply(ctx, args, signal) {
   const audit = await opInputAudit(ctx, { fix: true }, signal)
   const items = await listVideoItems(ctx, signal, 1)
   if (!items.length) throw new Error('当前时间线没有视频片段')
+  if (!audit.ok) {
+    return { ok: false, stage: 'input-audit', inputAudit: audit, error: '有片段的输入色彩空间无法确认或写入；已停止调色以免输出灰片' }
+  }
   // 非 RCM 项目没有项目级输入变换：先把内置 LOG→709 LUT 挂到 Node1，再建风格图。
   const restore = []
   if (!audit?.project?.managed) {
     for (const item of items) {
       try {
         const fixed = await opCameraFix(ctx, { itemId: item.id, nodeIndex: 1 }, signal)
-        restore.push({ itemId: item.id, name: item.name, ok: Boolean(fixed?.ok), applied: Boolean(fixed?.applied), lut: fixed?.lut ?? null, error: fixed?.error ?? null, note: fixed?.note ?? null })
+        const restored = fixed?.detection?.isLog === false || (fixed?.detection?.isLog === true && fixed?.ok && fixed?.applied)
+        restore.push({ itemId: item.id, name: item.name, ok: Boolean(restored), applied: Boolean(fixed?.applied), lut: fixed?.lut ?? null, error: restored ? null : (fixed?.error ?? fixed?.detection?.reason ?? '无法确认素材输入曲线'), note: fixed?.note ?? null })
       } catch (error) {
         restore.push({ itemId: item.id, name: item.name, ok: false, error: messageOf(error) })
       }
     }
   }
-  const warm = /暖|温暖|秋日|夕阳|金黄|amber|warm/i.test(text)
-  const cool = /冷|青|蓝|清爽|teal|cool/i.test(text)
-  const film = /胶片|电影|菲林|film|cinematic/i.test(text)
+  if (restore.some((row) => !row.ok)) {
+    return { ok: false, stage: 'restore', inputAudit: audit, restore, error: '有片段未能确认或完成 LOG 还原；已停止后续调色' }
+  }
+  const negative = (words) => new RegExp(`(?:不要|不需要|不用|别|勿)[^，。；,.!！?？]{0,10}(?:${words})`, 'i').test(text)
+  const warm = /暖|温暖|秋日|夕阳|金黄|amber|warm/i.test(text) && !negative('暖|秋日|夕阳|金黄')
+  const cool = /冷|青|蓝|清爽|teal|cool/i.test(text) && !negative('冷|青|蓝|清爽')
+  const film = /胶片|电影|菲林|film|cinematic/i.test(text) && !negative('胶片|电影|菲林|film|cinematic|风格')
   const recipe = {
     exposure: warm ? 0.012 : 0.004,
     contrast: film ? 1.055 : warm ? 1.04 : 1.025,
@@ -2919,10 +2936,16 @@ async function opVibeApply(ctx, args, signal) {
     splitHighlight: warm ? { r: 1.035, g: 1.0, b: 0.955 } : { r: 0.99, g: 1.0, b: 1.02 },
     skinGain: 1.004,
   }
-  let stylePreset = warm ? 'godfather' : cool ? 'teal-orange' : 'bleach'
+  // 基础调色请求不应暗中套用《教父》或漂白旁路；只有明确要风格时才加 Look LUT。
+  const wantsStyle = !negative('风格|胶片|电影|教父|漂白|青橙|赛博|情书|godfather|bleach|teal.orange|cyberpunk|love.letter')
+    && (film || /教父|漂白|青橙|赛博|情书|godfather|bleach|teal.orange|cyberpunk|love.letter/i.test(text))
+  let stylePreset = /漂白|bleach/i.test(text) ? 'bleach'
+    : /赛博|cyberpunk/i.test(text) ? 'cyberpunk'
+    : /情书|love.letter/i.test(text) ? 'love-letter'
+    : cool ? 'teal-orange' : 'godfather'
   let styleStrength = film ? 0.26 : 0.18
   let styleDomain = null
-  let useGeneratedLook = true
+  let useGeneratedLook = wantsStyle
   let externalStyleLut = null
   if (args.styleLutPath) {
     try {
@@ -2930,10 +2953,13 @@ async function opVibeApply(ctx, args, signal) {
       const compatible = lutCompatibleWithOutput(inspection, 'rec709')
       styleDomain = { inspection, compatible }
       if (compatible.ok) externalStyleLut = String(args.styleLutPath)
-      useGeneratedLook = !compatible.ok
+      useGeneratedLook = false
     } catch (error) {
       styleDomain = { error: messageOf(error) }
     }
+  }
+  if (args.styleLutPath && !externalStyleLut) {
+    return { ok: false, stage: 'style-domain', inputAudit: audit, restore, styleDomain, error: '外部 LUT 的输入域无法确认或与 Rec.709 时间线不兼容；未应用调色' }
   }
   const applied = []
   for (const item of items) {
@@ -2943,6 +2969,7 @@ async function opVibeApply(ctx, args, signal) {
         itemId: item.id,
         recipe,
         skipStyleLut: true,
+        safeMergeSaturation: true,
         styleStrength: film ? 0.9 : 0.75,
         localKeys: false,
         consistency: { gain: 1, warmth: warm ? 0.006 : 0 },
@@ -2973,22 +3000,35 @@ async function opVibeApply(ctx, args, signal) {
         style = { ok: false, error: messageOf(error) }
       }
     } else {
-      style = { generated: false, skipped: true, reason: '外部 LUT 输入域与 Rec.709 输出不兼容；已拒绝直接挂载，改用内置 look', domain: styleDomain }
+      style = { generated: false, skipped: true, reason: '用户只要求基础调色，未添加风格 LUT' }
     }
-    applied.push({ itemId: item.id, name: item.name, ok: Boolean(built?.ok), build3: built, style })
+    const styleOk = style?.skipped === true || Boolean(style?.setOk && style?.readback)
+    applied.push({ itemId: item.id, name: item.name, ok: Boolean(built?.ok && styleOk && built?.restoreReapplied?.ok !== false), build3: built, style })
   }
-  const shotMatch = await opGradeShotMatch(ctx, { targetLuma: Number(args.targetLuma) || 0.5305 }, signal).catch((error) => ({ ok: false, error: messageOf(error) }))
+  if (applied.length !== items.length || applied.some((row) => !row.ok)) {
+    return { ok: false, stage: 'grade-or-style', text, inputAudit: audit, restore, applied, error: '部分片段的节点或风格 LUT 未能应用并读回；未执行镜头匹配' }
+  }
+  // 全画面均值会把明亮庭院与阴影叶片误认成曝光不一致。
+  // 只有用户明确要求亮度匹配时才执行；默认保留镜头原有光线关系。
+  const targetLuma = Number.isFinite(Number(args.targetLuma)) && args.targetLuma != null
+    ? Number(args.targetLuma) : undefined
+  const wantsMatch = /统一亮度|匹配亮度|曝光一致|镜头亮度一致/i.test(text)
+    && !negative('统一亮度|匹配亮度|曝光一致|镜头亮度一致')
+  const matchLuma = args.matchLuma === true || targetLuma !== undefined || wantsMatch
+  const shotMatch = matchLuma
+    ? await opGradeShotMatch(ctx, { targetLuma }, signal).catch((error) => ({ ok: false, error: messageOf(error) }))
+    : { ok: true, skipped: true, reason: '不同取景不能仅按全画面平均亮度强行匹配；保留原场景明暗关系' }
   return {
-    ok: applied.some((row) => row.ok) && shotMatch?.ok !== false,
+    ok: applied.length === items.length && applied.every((row) => row.ok) && shotMatch?.ok === true && (shotMatch.skipped || shotMatch.applied === items.length),
     text,
     intent: { warm, cool, film },
     recipe,
     inputAudit: audit,
     restore: restore.length ? restore : undefined,
     applied,
-    stylePlan: { generatedLook: useGeneratedLook && !externalStyleLut, externalLut: externalStyleLut, preset: externalStyleLut ? null : stylePreset, strength: externalStyleLut ? null : styleStrength, externalDomain: styleDomain },
+    stylePlan: { generatedLook: useGeneratedLook && !externalStyleLut, externalLut: externalStyleLut, preset: useGeneratedLook ? stylePreset : null, strength: useGeneratedLook ? styleStrength : null, externalDomain: styleDomain },
     shotMatch,
-    note: '单入口完成：逐片段输入审计/修正 → 基础三层调色 → 独立风格 LUT 节点 → 末尾 CDL 镜头亮度匹配；不使用外部脚本。',
+    note: `逐片段输入审计/修正 → 基础校正${useGeneratedLook || externalStyleLut ? ' → 独立风格 LUT' : ''}${matchLuma ? ' → 指定亮度匹配' : ''}；画面风格仍须以 Resolve 成片复核。`,
   }
 }
 
@@ -5185,6 +5225,20 @@ async function opGradeBuild3(ctx, args, signal) {
     localKeys: args.localKeys,
   })
   const drxNodes = toDrxNodes(graph)
+  // drx.merge 会在每次追加节点时再次缩放已有节点的 saturation，导致早期
+  // 饱和度节点在最终 DRX 中趋近零。一键流程先生成中性节点，应用后再用 CDL
+  // 在原位写入饱和度；该工具此前已在 Resolve 渲染正对照中验证能改变像素。
+  const safeSaturation = args.safeMergeSaturation === true
+    ? graph.nodes.findIndex((node) => node.tool === 'saturation') + 1 : 0
+  const saturationValue = safeSaturation ? Number(graph.nodes[safeSaturation - 1].params.saturation) / 50 : null
+  if (safeSaturation) {
+    drxNodes.base = { ...drxNodes.base, params: { ...drxNodes.base.params } }
+    drxNodes.newNodes = drxNodes.newNodes.map((node) => {
+      const params = { ...node.params }
+      delete params.saturation
+      return { ...node, params }
+    })
+  }
   // 逐组参数写入后逐个节点「生成→解析读回」，确认没有被相邻节点/默认值覆盖
   let recipeVerification = null
   let qualifierVerification = null
@@ -5308,6 +5362,12 @@ async function opGradeBuild3(ctx, args, signal) {
     const node1 = (rr.ok ? rr.value?.nodes ?? [] : []).find((node) => Number(node.node_index) === 1) ?? null
     restoreReapplied = { ok: Boolean(re.ok && node1?.lut), mountedLut: node1?.lut ?? null, source: preNode1Lut ? 'before-build' : 'args' }
   }
+  let postMergeSaturation = null
+  if (safeSaturation) {
+    const cdl = { NodeIndex: safeSaturation, Slope: [1, 1, 1], Offset: [0, 0, 0], Power: [1, 1, 1], Saturation: saturationValue }
+    const result = await settle(callTool(ctx, 'timeline_item_color', { action: 'safe_set_cdl', cdl, source: 'item', ...scopeOf(item.id) }, signal))
+    postMergeSaturation = { ok: Boolean(result.ok && result.value?.success === true), nodeIndex: safeSaturation, saturation: saturationValue, error: result.ok ? null : messageOf(result.error) }
+  }
 
   // 5) 风格 LUT 挂到「独立」的 12 号节点（不塞进校正节点）
   let look = null
@@ -5363,7 +5423,7 @@ async function opGradeBuild3(ctx, args, signal) {
   }
   const rendered = delta ? !isNegligible(delta) : null
   return {
-    ok: Boolean(applied.applied.ok),
+    ok: Boolean(applied.applied.ok && postMergeSaturation?.ok !== false && restoreReapplied?.ok !== false),
     itemId: item.id,
     itemName: info.name,
     graph: { nodeCount: graph.nodeCount, layers: graph.layers, routing: graph.routing, nodes: graph.nodes.map((node) => ({ id: node.id, layer: node.layer, label: node.label, tool: node.tool })) },
@@ -5373,6 +5433,7 @@ async function opGradeBuild3(ctx, args, signal) {
     error: applied.applied.ok ? null : applied.applied.error,
     look,
     restoreReapplied,
+    postMergeSaturation,
     colorManagement: { mode: projectValues.colorScienceMode ?? null, input: projectValues.colorSpaceInput ?? null, timeline: projectValues.colorSpaceTimeline ?? null, output: projectValues.colorSpaceOutput ?? null, rcmManaged },
     nodeGraph: nodes.ok ? nodes.value : null,
     verification: { frameDelta: delta, rendered, beforeFrame: beforeFrame.path, afterFrame: afterFrame.path },
@@ -7258,7 +7319,7 @@ async function opFeedbackIssue(ctx, args, signal) {
     '',
     '### 环境',
     '```json',
-    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.13.2' }, null, 2),
+    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.13.3' }, null, 2),
     '```',
     '',
     '### 调试日志（最近）',

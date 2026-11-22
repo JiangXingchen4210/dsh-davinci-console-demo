@@ -1,3 +1,14 @@
+## 0.13.3 — S5 Gamma 识别与 Vibe 管线保护
+
+- **真实灰片根因修复**：Panasonic 识别改为读取实际 `CaptureGamma`；`CINELIKE_D2 / BT.709` 不再被误判为 V-Log，V-Log 仍按 V-Log 处理
+- **输入保护**：片段 Input Color Space 写入未确认时停止 Vibe 调色，不再输出灰片
+- **LUT 域保护**：未知输入域或与 Rec.709 时间线不兼容的外部 LUT 不再自动挂载
+- **基础调色不偷偷加风格**：只有明确要求风格时才生成 Look LUT；默认不套《教父》/漂白
+- **negation 处理**：用户说“不要风格 / 不要统一亮度”时不会被关键词误触发
+- **drx.merge 饱和度**：merge 后用 CDL 在原位写回饱和度，避免重复缩放导致饱和度趋零；Resolve 实测 node7 饱和度控制 SATAVG 27.93 → 49.22
+- **真实 S5 回归**：V-Log 镜头正常还原；CINELIKE_D2 镜头按 Rec.709 处理，渲染无灰片；168 帧 ProRes 422 HQ 输出
+- **测试**：44/44 pass
+
 ## 0.13.2 — 品牌迁移：dsh-davinci-console-demo（npm 包名不变）
 
 - GitHub 仓库从 `Davinci_MCP_DSH_Demo` 重命名为 `dsh-davinci-console-demo`（GitHub 旧链接自动重定向）

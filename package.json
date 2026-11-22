@@ -1,6 +1,6 @@
 {
   "name": "davinci-console-demo",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "private": false,
   "description": "[DEMO] dsh-davinci-console-demo（npm: davinci-console-demo）— Vibe Color 单入口、输入审计、基础校正、镜头匹配、独立风格；DaVinci Resolve DSH 插件。需要 macOS + Resolve Studio + Resolve MCP。",
   "type": "module",

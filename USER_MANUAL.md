@@ -1,4 +1,4 @@
-# dsh-davinci-console-demo · 使用手册（v0.13.2）
+# dsh-davinci-console-demo · 使用手册（v0.13.3）
 
 > 显示名：`dsh-davinci-console-demo`（DSH Web 侧边栏「插件 → dsh-davinci-console-demo」）
 > npm 包名：`davinci-console-demo`（保持不变）
