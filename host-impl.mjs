@@ -596,6 +596,7 @@ async function buildLayeredDrx(ctx, signal, plan, labelPrefix, targetStats) {
   const dynamicRange = Number(target.global?.dynamicRange ?? 0)
   if (usable(layers.shadow) && dynamicRange > 0.15) push('shadow', layers.shadow)
   if (usable(layers.neutral)) push('neutral', layers.neutral)
+  if (plan?.addStyleNode) newNodes.push({ label: '06 风格 LUT', params: { space: 'ui' } })
 
   if (newNodes.length === 0) return { path: basePath, nodes: 1 }
 
@@ -1631,6 +1632,9 @@ async function opGradeTiers(ctx, args, signal) {
   const saved = await settle(
     callTool(ctx, 'timeline_item_color', { action: 'add_version', name: versionName, ...scopeOf(itemId) }, signal),
   )
+  // grade.tiers 的 reset/apply 会重建节点图；先保存 Node1 输入还原 LUT，应用后若丢失就补回并读回。
+  const preNodes = await settle(callTool(ctx, 'timeline_item_color', { action: 'probe_node_graph', ...scopeOf(itemId) }, signal))
+  const preInputLut = (preNodes.ok ? preNodes.value?.nodes ?? [] : []).find((node) => Number(node.node_index) === 1)?.lut || null
   if (args.resetFirst) await resetGradeConfirmed(ctx, signal, itemId)
   const applied = await applyDrxConfirmed(ctx, signal, {
     path: outPath,
@@ -1638,11 +1642,20 @@ async function opGradeTiers(ctx, args, signal) {
     require_temp_path: true,
     ...scopeOf(itemId),
   })
+  let inputRestore = null
+  if (preInputLut) {
+    const re = await settle(callTool(ctx, 'graph', { action: 'set_lut', node_index: 1, lut_path: preInputLut, source: 'item', ...scopeOf(itemId) }, signal))
+    const rd = await settle(callTool(ctx, 'graph', { action: 'get_lut', node_index: 1, source: 'item', ...scopeOf(itemId) }, signal))
+    const mounted = rd.ok ? (rd.value?.lut ?? rd.value ?? null) : null
+    inputRestore = { ok: Boolean(re.ok && String(mounted ?? '') === String(preInputLut)), lutPath: preInputLut, mountedLut: mounted, expectedLut: preInputLut }
+  }
   const nodes = await settle(
     callTool(ctx, 'timeline_item_color', { action: 'probe_node_graph', ...scopeOf(itemId) }, signal),
   )
   return {
-    ok: applied.applied.ok,
+    ok: Boolean(applied.applied.ok && inputRestore?.ok !== false),
+    inputLutBefore: preInputLut,
+    inputRestore,
     versionName: saved.ok ? versionName : null,
     drxPath: outPath,
     expectedNodes: built.nodes.length,
@@ -1763,16 +1776,20 @@ async function visionJsonCall(ctx, { images, system, userText, provider, model, 
     const abort = () => controller.abort(signal?.reason ?? new Error('aborted'))
     if (signal?.aborted) abort(); else signal?.addEventListener?.('abort', abort, { once: true })
     let text = ''
+    let finish = null
     try {
       const stream = llm.stream({ provider: useProvider, model: useModel, system, messages: [{ role: 'user', content }], temperature: 0, maxTokens, signal: controller.signal })
       for await (const chunk of stream) {
         if (chunk?.type === 'text-delta') text += chunk.text ?? ''
-        if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') throw new Error(chunk.reason.failure?.message ?? '模型调用失败')
+        if (chunk?.type === 'finish') {
+          finish = chunk.reason ?? null
+          if (finish?.kind === 'error') throw new Error(finish.failure?.message ?? '模型调用失败')
+        }
       }
     } finally {
       clearTimeout(timer); signal?.removeEventListener?.('abort', abort)
     }
-    return { ok: true, text, provider: useProvider, model: useModel, count: refs.length }
+    return { ok: true, text, provider: useProvider, model: useModel, count: refs.length, finish }
   } catch (error) {
     return { ok: false, provider: useProvider, model: useModel, error: messageOf(error) }
   }
@@ -2895,7 +2912,382 @@ const ROUTE_RULES = [
  * 自然语言 → 执行计划。默认只出计划（plan-only），execute:true 才真正调用（只调用非破坏性/自带版本保护的动作）。
  */
 /** 单入口 Vibe Color：输入审计/修正 → 基础三级调色 → 独立风格节点 → 镜头匹配。 */
+/** 抓取同一镜头的多张「Resolve 已处理」帧，缩小成模型可读的 JPEG；不改原时间线。 */
+async function captureVisionFrames(ctx, signal, item, count = 3) {
+  const current = await settle(callTool(ctx, 'timeline', { action: 'get_current' }, signal))
+  const fps = await projectFps(ctx, signal)
+  const timelineStart = Number(current.ok ? current.value?.start_frame : 0) || 0
+  const start = Number(item.start) || 0
+  const end = Number(item.end) || start + 1
+  const original = await settle(callTool(ctx, 'timeline_markers', { action: 'get_current_timecode' }, signal))
+  const frames = []
+  const dir = await ensureDataDir(path.join('frames', `vibe-vision-${stamp()}`))
+  try {
+    for (let index = 0; index < count; index += 1) {
+      const fraction = count === 1 ? 0.5 : (index + 0.5) / count
+      const frameOffset = Math.max(0, Math.round((end - start - 1) * fraction))
+      const timecode = framesToTimecode(start - timelineStart + frameOffset, fps)
+      const seek = await settle(callTool(ctx, 'timeline_markers', { action: 'set_current_timecode', timecode }, signal))
+      if (!seek.ok) throw new Error(`定位 ${timecode} 失败：${messageOf(seek.error)}`)
+      const captured = await captureRenderedFrame(ctx, signal, `vibe-vision-${index + 1}`)
+      const outPath = path.join(dir, `frame-${index + 1}.jpg`)
+      await run('sips', ['-Z', '384', '-s', 'format', 'jpeg', captured.path, '--out', outPath], { timeoutMs: 60_000 })
+      frames.push({ timeSec: Number(((frameOffset) / Math.max(1, fps)).toFixed(3)), timecode, path: outPath, sourcePath: captured.path })
+    }
+  } finally {
+    const tc = original.ok ? original.value?.timecode : null
+    if (tc) await settle(callTool(ctx, 'timeline_markers', { action: 'set_current_timecode', timecode: tc }, signal))
+  }
+  return frames
+}
+
+async function imageMetrics(framePath) {
+  try {
+    const probe = await ffprobeJson(framePath).catch(() => null)
+    const stream = (probe?.streams ?? []).find((entry) => entry.codec_type === 'video')
+    const width = Number(stream?.width) || null
+    const height = Number(stream?.height) || null
+    if (!width || !height) return null
+    const raw = await runCapture('ffmpeg', ['-v', 'error', '-i', framePath, '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-'], { timeoutMs: 120_000 })
+    const buf = Buffer.isBuffer(raw.stdout) ? raw.stdout : Buffer.from(raw.stdout ?? '', 'binary')
+    const total = width * height
+    if (buf.length < total * 3) return null
+    let highlight = 0; let shadow = 0; let lumaSum = 0; let satSum = 0; let spill = 0
+    const luma8 = new Uint8Array(total)
+    const channelHigh = [0, 0, 0]; const channelLow = [0, 0, 0]
+    for (let i = 0; i < total; i += 1) {
+      const r = buf[i * 3] / 255; const g = buf[i * 3 + 1] / 255; const b = buf[i * 3 + 2] / 255
+      const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+      luma8[i] = Math.max(0, Math.min(255, Math.round(luma * 255)))
+      lumaSum += luma
+      const max = Math.max(r, g, b); const min = Math.min(r, g, b)
+      satSum += max > 0 ? (max - min) / max : 0
+      if (luma > 0.98) highlight += 1
+      if (luma < 0.02) shadow += 1
+      const values = [r, g, b]
+      for (let c = 0; c < 3; c += 1) {
+        if (values[c] >= 0.985) channelHigh[c] += 1
+        if (values[c] <= 0.015) channelLow[c] += 1
+      }
+      // 色彩溢出：某一通道接近满值、但另两通道明显未满的“单通道裁切”
+      if (max >= 0.985 && min < 0.72) spill += 1
+    }
+    // 断层/banding：统计低梯度区域里相邻像素的硬台阶；只在亮度平台边缘计数。
+    let steps = 0; let samples = 0
+    const stepAt = (a, b, c) => Math.abs(b - a) >= 3 && Math.abs(c - b) <= 1 && Math.abs(b - a) >= Math.abs(c - a)
+    for (let y = 1; y < height - 1; y += 2) {
+      for (let x = 1; x < width - 1; x += 2) {
+        const i = y * width + x
+        samples += 1
+        if (stepAt(luma8[i - 1], luma8[i], luma8[i + 1])) steps += 1
+      }
+    }
+    const bandingRatio = samples ? steps / samples : null
+    return {
+      width, height,
+      luma: Number((lumaSum / total).toFixed(4)),
+      saturation: Number((satSum / total).toFixed(4)),
+      clipping: {
+        highlightRatio: Number((highlight / total).toFixed(6)),
+        shadowRatio: Number((shadow / total).toFixed(6)),
+        threshold: { highlightLuma: 0.98, shadowLuma: 0.02 },
+      },
+      quality: {
+        banding: { ratio: bandingRatio == null ? null : Number(bandingRatio.toFixed(6)), method: 'low-gradient-hard-step', checked: bandingRatio != null },
+        spill: {
+          ratio: Number((spill / total).toFixed(6)),
+          channelHigh: channelHigh.map((value) => Number((value / total).toFixed(6))),
+          channelLow: channelLow.map((value) => Number((value / total).toFixed(6))),
+          method: 'single-channel-clipping',
+          checked: true,
+        },
+      },
+    }
+  } catch { return null }
+}
+
+async function visionMetrics(frames) {
+  const rows = []
+  for (const frame of frames) rows.push(await imageMetrics(frame.sourcePath ?? frame.path))
+  const valid = rows.filter(Boolean)
+  const luma = valid.map((row) => row.luma).filter((value) => Number.isFinite(value))
+  const maxLumaJump = luma.length < 2 ? null : Math.max(...luma.slice(1).map((value, index) => Math.abs(value - luma[index])))
+  return {
+    frames: rows,
+    clipping: valid[0]?.clipping ?? null,
+    saturation: { mean: valid.length ? valid.reduce((sum, row) => sum + (row.saturation ?? 0), 0) / valid.length : null },
+    temporal: { maxLumaJump: maxLumaJump == null ? null : Number(maxLumaJump.toFixed(4)) },
+  }
+}
+
+/** 视觉驱动的 Vibe Color：模型看多帧 → 结构化判断 → 只走安全调色 → 调整后模型复看。 */
+async function opVibeVision(ctx, args, signal) {
+  const text = String(args.text ?? '').trim()
+  if (!text) throw new Error('vibe.vision 需要 text（用户目标）')
+  const { parseVibeVision, parseVibeReview, visionRecipe, objectiveFlags, aggregateObjective, VIBE_VISION_SYSTEM_PROMPT, VIBE_REVIEW_SYSTEM_PROMPT, buildVibeVisionPrompt } = await importFresh('lib/vision_color.mjs')
+  // 先读元数据/原始帧，再做输入审计；否则模型看到的已被 fix:true 改过，无法证明独立判断。
+  const preAudit = await opInputAudit(ctx, { fix: false }, signal)
+  const items = args.itemId
+    ? (await listVideoItems(ctx, signal, 1)).filter((entry) => entry.id === args.itemId)
+    : await listVideoItems(ctx, signal, 1)
+  if (!items.length) throw new Error('V1 没有片段')
+  const results = []
+  for (const item of items) {
+    const { info } = await resolveItemContext(ctx, signal, item.id)
+    const metadata = await opCameraDetect(ctx, { itemId: item.id }, signal)
+    let sourceFramePath = null
+    try { sourceFramePath = (await exportSourceFrame(ctx, signal, item.id))?.path ?? null } catch {}
+    const preRow = (preAudit?.rows ?? []).find((row) => row.itemId === item.id) ?? null
+    const frameCount = Math.max(2, Math.min(4, Number(args.frames) || 3))
+    let frames
+    try {
+      frames = await captureVisionFrames(ctx, signal, item, frameCount)
+    } catch (error) {
+      return { ok: false, stage: 'capture', itemId: item.id, error: `抓取 Resolve 已处理帧失败：${messageOf(error)}` }
+    }
+    if (!frames.length) return { ok: false, stage: 'capture', itemId: item.id, error: '没有抓到可交给视觉模型的帧' }
+    const images = []
+    for (const frame of frames) images.push({ data: await fs.readFile(frame.path), mediaType: 'image/jpeg', name: path.basename(frame.path) })
+    let call = await visionJsonCall(ctx, {
+      images,
+      system: VIBE_VISION_SYSTEM_PROMPT,
+      userText: buildVibeVisionPrompt({ text, clipName: item.name, frames }),
+      provider: args.visionProvider,
+      model: args.visionModel,
+      maxTokens: 6000,
+      signal,
+    })
+    let parsed = call.ok && String(call.text ?? '').trim() ? parseVibeVision(call.text) : { ok: false, error: call.ok ? '空文本' : (call.error ?? 'vision failed') }
+    let visionAttempts = 1
+    if (!parsed.ok) {
+      // 模型偶发把全部 tokens 用在 reasoning、text 为空：换更紧凑的 schema 重试一次，仍失败则明确失败。
+      const compactSystem = '你是电影调色师。只输出一个 JSON 对象，不要解释：{"scene":"...","subjects":["..."],"faces":{"present":true/false,"count":0},"lighting":{"direction":"...","quality":"...","contrast":"low|medium|high","key":"..."},"issues":[{"type":"...","severity":"low|medium|high","region":"...","timeSec":0,"evidence":"...","suggestion":"...","confidence":0..1}],"adjustments":{"exposure":0,"contrast":1,"saturation":1,"temperature":0,"tint":0},"style":{"preset":"none|teal-orange|bleach|cyberpunk","strength":0,"reason":"..."},"skin":{"needed":false,"brightness":0,"saturation":1,"protectHue":true,"reason":"..."},"overallConfidence":0..1}'
+      call = await visionJsonCall(ctx, {
+        images,
+        system: compactSystem,
+        userText: `用户目标：${text}\n镜头：${item.name}。根据这些帧输出上述 JSON；不猜画面外信息。`,
+        provider: args.visionProvider,
+        model: args.visionModel,
+        maxTokens: 8000,
+        signal,
+      })
+      visionAttempts = 2
+      parsed = call.ok && String(call.text ?? '').trim() ? parseVibeVision(call.text) : { ok: false, error: call.ok ? '空文本' : (call.error ?? 'vision failed') }
+    }
+    if (!call.ok) {
+      return { ok: false, stage: 'vision', itemId: item.id, itemName: item.name, provider: call.provider ?? null, model: call.model ?? null, frames, finish: call.finish ?? null, attempts: visionAttempts, error: `视觉模型调用失败：${call.error ?? 'unknown'}；未应用、未回退到关键词 recipe` }
+    }
+    if (!String(call.text ?? '').trim()) {
+      return { ok: false, stage: 'vision-empty', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, finish: call.finish ?? null, textLength: 0, attempts: visionAttempts, error: '视觉模型返回空文本（两次尝试均未产生内容）；未应用，不把空响应当成功' }
+    }
+    if (!parsed.ok) {
+      return { ok: false, stage: 'validate', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, finish: call.finish ?? null, textLength: call.text?.length ?? 0, attempts: visionAttempts, rawText: call.text.slice(0, 4000), error: `模型返回但不是合法调色 JSON：${parsed.error}；未应用` }
+    }
+    const analysis = parsed.analysis
+    const metricsBefore = await visionMetrics(frames)
+    metricsBefore.aggregate = aggregateObjective(metricsBefore)
+    const recipe = visionRecipe(analysis)
+    const style = analysis.style?.preset && analysis.style.preset !== 'none' ? analysis.style : null
+    if (args.apply === false) {
+      results.push({
+        itemId: item.id,
+        itemName: item.name,
+        provider: call.provider,
+        model: call.model,
+        frameCount: frames.length,
+        frames,
+        analysis,
+        recipe,
+        style,
+        planned: true,
+        localCorrection: analysis.skin?.needed === true
+          ? { requested: true, applied: false, reason: '主管线尚未实现可跟踪的局部肤色节点；本轮只给计划', suggestion: analysis.skin }
+          : { requested: false, applied: false },
+        review: { ok: false, skipped: true, reason: '这是执行计划，尚未写入和复看' },
+      })
+      continue
+    }
+    // 模型独立看完之后才允许做输入修正；修正失败则停止，不继续套 LUT/预设。
+    let auditFix = null
+    let postRow = null
+    if (args.apply !== false) {
+      auditFix = await opInputAudit(ctx, { fix: true }, signal)
+      postRow = (auditFix?.rows ?? []).find((row) => row.itemId === item.id) ?? null
+      if (!auditFix.ok || (postRow && postRow.isLog && postRow.written && postRow.verified === false)) {
+        return { ok: false, stage: 'input-audit-after-vision', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, metadata, preAudit: preRow, auditFix, error: '视觉判断后输入色彩空间修正未通过；已停止，不输出灰片或补套 LUT' }
+      }
+    }
+    // 技术转换必须进入主入口：V-Log 元数据确认后才挂官方/内置 LOG→709 LUT；
+    // BT.709/未知曲线绝不因画面发灰而套 Log LUT。
+    let technical = { method: 'none', ok: true, reason: '未确认 LOG；按显示素材处理，不套技术 LUT' }
+    if (args.apply !== false) {
+      const logConfirmed = preRow?.isLog === true && Number(preRow?.confidence) >= 0.8
+      if (logConfirmed) {
+        if (!auditFix?.project?.managed) {
+          const fixed = await opCameraFix(ctx, { itemId: item.id, nodeIndex: 1 }, signal)
+          const nodeRead = await settle(callTool(ctx, 'timeline_item_color', { action: 'probe_node_graph', ...scopeOf(item.id) }, signal))
+          const node1Lut = (nodeRead.ok ? nodeRead.value?.nodes ?? [] : []).find((node) => Number(node.node_index) === 1)?.lut ?? ''
+          const expected = fixed?.lut?.staged ?? fixed?.lut?.path ?? null
+          const ok = Boolean(fixed?.ok && fixed?.applied && expected && String(node1Lut) === String(expected))
+          technical = { method: 'node1-log-to-rec709', ok, inputLutBefore: preRow?.beforeInputColorSpace ?? null, node1Lut, expectedLut: expected, camera: preRow?.camera ?? null, curve: preRow?.curve ?? null, error: ok ? null : (fixed?.error ?? 'LOG LUT 未确认挂到 Node1') }
+          if (!ok) {
+            return { ok: false, stage: 'technical-transform', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, metadata, preAudit: preRow, technical, error: '技术还原未通过 Node1 读回；已停止，不输出灰片' }
+          }
+        } else {
+          const target = postRow?.targetInputColorSpace ?? null
+          const actual = String(postRow?.afterInputColorSpace ?? '').trim()
+          const ok = Boolean(postRow?.verified && target && actual === String(target))
+          technical = { method: 'input-color-space', ok, target, actual, camera: preRow?.camera ?? null, curve: preRow?.curve ?? null, error: ok ? null : '项目输入色彩空间未确认写入' }
+          if (!ok) {
+            return { ok: false, stage: 'technical-transform', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, metadata, preAudit: preRow, technical, error: 'RCM 输入色彩空间未通过读回；已停止' }
+          }
+        }
+      } else if (preRow?.isLog === null) {
+        technical = { method: 'none', ok: false, reason: '色彩曲线未确认；不套 Log LUT，也不声称技术还原完成' }
+      }
+    }
+    const applied = await opGradeBuild3(ctx, {
+      itemId: item.id,
+      recipe,
+      lookPreset: style?.preset ?? null,
+      lookStrength: style?.strength ?? null,
+      skipStyleLut: !style,
+      safeMergeSaturation: true,
+      localKeys: false,
+      localStrength: 0,
+    }, signal)
+    if (!applied?.ok) {
+      return { ok: false, stage: 'apply', itemId: item.id, itemName: item.name, provider: call.provider, model: call.model, frames, analysis, recipe, style, applied, error: '安全调色落地失败；未把模型建议当作已应用' }
+    }
+    const afterFrames = await captureVisionFrames(ctx, signal, item, frameCount)
+    const afterImages = []
+    for (const frame of afterFrames) afterImages.push({ data: await fs.readFile(frame.path), mediaType: 'image/jpeg', name: path.basename(frame.path) })
+    // 复看必须给模型 before/after 配对，而不是只看 after；每对带同一时间码。
+    const pairedImages = [
+      ...frames.map((frame, index) => ({ data: images[index].data, mediaType: 'image/jpeg', name: `before-${index + 1}.jpg` })),
+      ...afterFrames.map((frame, index) => ({ data: afterImages[index].data, mediaType: 'image/jpeg', name: `after-${index + 1}.jpg` })),
+    ]
+    const pairs = frames.map((frame, index) => `第 ${index + 1} 对：before t=${frame.timeSec}s / after t=${afterFrames[index]?.timeSec ?? frame.timeSec}s`).join('\n')
+    const reviewText = `复看同一镜头的调整前后配对。用户目标：${text}\n${pairs}\n前 ${frames.length} 张是 before，后 ${frames.length} 张是 after。判断 after 是否真的更好、是否新增肤色/高光/背景问题；只输出同一 JSON schema。`
+    const review = await visionJsonCall(ctx, {
+      images: pairedImages,
+      system: VIBE_REVIEW_SYSTEM_PROMPT,
+      userText: reviewText,
+      provider: args.visionProvider,
+      model: args.visionModel,
+      maxTokens: 6000,
+      signal,
+    })
+    let reviewParsed = review.ok && String(review.text ?? '').trim()
+      ? parseVibeReview(review.text)
+      : { ok: false, error: review.ok ? '复看模型返回空文本' : (review.error ?? 'review failed'), finish: review.finish ?? null, textLength: review.text?.length ?? 0 }
+    let reviewAttempts = 1
+    if (!reviewParsed.ok) {
+      // 复看失败不静默通过：换更短的复看提示，再给模型一次机会；仍失败就明确标记。
+      const retry = await visionJsonCall(ctx, {
+        images: pairedImages,
+        system: '你是电影调色师。只输出一个 JSON 对象，不要解释：{"verdict":"improved|worse|uncertain","confidence":0..1,"evidence":"...","pairs":[{"index":1,"timeSec":0,"risk":"low|medium|high","confidence":0..1,"evidence":"..."}],"issues":[{"type":"...","severity":"low|medium|high","region":"...","timeSec":0,"evidence":"...","confidence":0..1}]}',
+        userText: `复看调整前后配对：前 ${frames.length} 张 before，后 ${frames.length} 张 after，同一时间码配对。用户目标：${text}。只评估 after 是否更好、是否新增肤色/高光/背景问题；只输出 JSON。`,
+        provider: args.visionProvider,
+        model: args.visionModel,
+        maxTokens: 3000,
+        signal,
+      })
+      reviewAttempts = 2
+      reviewParsed = retry.ok && String(retry.text ?? '').trim() ? parseVibeReview(retry.text) : { ok: false, error: retry.ok ? '复看模型返回空文本' : (retry.error ?? 'review failed') }
+      if (!reviewParsed.ok) reviewParsed = { ...reviewParsed, finish: retry.finish ?? null, textLength: retry.text?.length ?? 0, error: `${reviewParsed.error ?? 'review failed'}；复看重试也失败` }
+    }
+    const metricsAfter = await visionMetrics(afterFrames)
+    metricsAfter.aggregate = aggregateObjective(metricsAfter)
+    const flags = objectiveFlags(analysis, metricsAfter)
+    const localRequested = analysis.skin?.needed === true
+    results.push({
+      itemId: item.id,
+      itemName: item.name,
+      provider: call.provider,
+      model: call.model,
+      frameCount: frames.length,
+      visionAttempts,
+      frames,
+      sourceFramePath,
+      metadata,
+      inputAuditBefore: preRow,
+      inputAuditAfter: postRow,
+      curveConfirmed: (metadata?.detection?.evidence ?? []).some((item) => /CaptureGamma=/i.test(String(item)))
+        ? (preRow?.isLog === true && Number(preRow.confidence) >= 0.8 ? 'log-confirmed' : 'not-log-confirmed')
+        : 'unconfirmed',
+      technical,
+      analysis,
+      recipe,
+      style,
+      applied: { ok: applied.ok, nodeGraph: applied.nodeGraph ?? null, style: applied.style ?? null, restoreReapplied: applied.restoreReapplied ?? null, technicalLutPreserved: technical?.method === 'node1-log-to-rec709' ? Boolean(applied.restoreReapplied?.ok && String(applied.restoreReapplied.mountedLut ?? '') === String(technical.node1Lut ?? '')) : null },
+      review: reviewParsed.ok
+        ? { ok: reviewParsed.passed === true, provider: review.provider, model: review.model, frames: { before: frames, after: afterFrames }, verdict: reviewParsed.verdict, confidence: reviewParsed.confidence, evidence: reviewParsed.evidence, pairs: reviewParsed.pairs, issues: reviewParsed.issues, attempts: reviewAttempts }
+        : { ok: false, provider: review.provider ?? null, model: review.model ?? null, frames: { before: frames, after: afterFrames }, attempts: reviewAttempts, error: reviewParsed.error ?? review.error ?? '复看失败' },
+      metrics: { before: metricsBefore, after: metricsAfter },
+      objectiveFlags: flags,
+      localCorrection: localRequested
+        ? { requested: true, applied: false, reason: '本轮未用静态窗口/全画面肤色 qualifier 冒充已完成；需要可跟踪的局部肤色节点或 Fusion 方案', suggestion: analysis.skin }
+        : { requested: false, applied: false },
+      complete: Boolean(reviewParsed.passed === true && !localRequested && flags.length === 0 && metricsAfter.aggregate?.unverifiedChecks?.length === 0),
+    })
+  }
+  const plannedOnly = results.every((row) => row.planned === true)
+  if (plannedOnly) {
+    return {
+      ok: true,
+      stage: 'planned',
+      complete: false,
+      acceptance: 'planned',
+      acceptanceReason: 'not-applied',
+      text,
+      provider: results[0]?.provider ?? null,
+      model: results[0]?.model ?? null,
+      results,
+      note: '模型已完成多帧判断并给出计划；尚未写入 Resolve，也未做调整后复看。',
+    }
+  }
+  const technicalOk = results.every((row) => row.technical?.ok !== false && (row.technical?.method !== 'node1-log-to-rec709' || row.applied?.technicalLutPreserved === true))
+  const reviewOk = results.every((row) => row.review?.ok === true && row.applied?.ok === true)
+  const localRequested = results.some((row) => row.localCorrection?.requested === true)
+  const objectiveFailed = results.some((row) => (row.objectiveFlags ?? []).length > 0)
+  const verdicts = results.map((row) => ({ itemId: row.itemId, verdict: row.review?.verdict ?? null, confidence: row.review?.confidence ?? null }))
+  const unverified = [...new Set(results.flatMap((row) => row.metrics?.after?.aggregate?.unverifiedChecks ?? row.metrics?.after?.unverifiedChecks ?? []))]
+  const complete = technicalOk && reviewOk && !localRequested && !objectiveFailed && unverified.length === 0
+  const ok = complete
+  const stage = !technicalOk ? 'technical-failed' : !reviewOk ? 'review-not-passed' : localRequested ? 'local-unsupported' : objectiveFailed ? 'objective-failed' : 'checks-unverified'
+  return {
+    ok,
+    callOk: reviewOk,
+    acceptance: complete ? 'passed' : 'partial',
+    acceptanceReason: complete ? null : (!technicalOk ? 'technical-failed' : (unverified.length ? 'unverified-checks' : (localRequested ? 'local-not-applied' : (objectiveFailed ? 'objective-failed' : 'review-not-passed')))),
+    stage,
+    complete,
+    technicalOk,
+    localRequested,
+    objectiveFailed,
+    verdicts,
+    unverifiedChecks: unverified,
+    text,
+    provider: results[0]?.provider ?? null,
+    model: results[0]?.model ?? null,
+    results,
+    note: results.some((row) => row.localCorrection.requested)
+      ? '模型建议局部肤色修正，但本轮未把静态/全画面 qualifier 当作已完成；请把 localCorrection 明确视为未完成。'
+      : '模型调用、schema 校验、安全落地和调整后复看均已完成；审美结论仍需人工复核。',
+  }
+}
+
+/** 主入口：一句话 Vibe 默认走视觉模型；失败明确返回，不回退关键词 recipe。 */
 async function opVibeApply(ctx, args, signal) {
+  const text = String(args.text ?? '').trim()
+  if (!text) throw new Error('vibe.apply 需要 text（用户的一句话）')
+  if (args.legacy === true) return opVibeApplyClassic(ctx, args, signal)
+  const vision = await opVibeVision(ctx, { ...args, text, apply: true }, signal)
+  return { ...vision, mode: 'vision', vision }
+}
+
+async function opVibeApplyClassic(ctx, args, signal) {
   const text = String(args.text ?? '').trim()
   if (!text) throw new Error('vibe.apply 需要 text（用户的一句话）')
   const { writeLookLut } = await importFresh('lib/lookgen.mjs')
@@ -3035,6 +3427,11 @@ async function opVibeApply(ctx, args, signal) {
 async function opVibeRun(ctx, args, signal) {
   const text = String(args.text ?? '').trim()
   if (!text) throw new Error('vibe.run 需要 text（用户的一句话）')
+  // 颜色/风格/肤色类请求默认用视觉模型做多帧计划；非颜色控制仍走原来的路由。
+  if (!args.legacy && /风格|调色|肤色|颜色|青橙|胶片|亮度|曝光|高光|白平衡|色温|look|color|skin|warm|cool|teal/i.test(text)) {
+    const vision = await opVibeVision(ctx, { ...args, text, apply: false }, signal)
+    return { ...vision, mode: 'vision-plan', vision }
+  }
   const { parseVibe } = await importFresh('lib/grade3.mjs')
   const vibe = parseVibe(text)
   const matched = ROUTE_RULES.filter((rule) => rule.match.test(text))
@@ -3554,33 +3951,81 @@ async function opStyleApply(ctx, args, signal) {
   const { writeLookLut } = await importFresh('lib/lookgen.mjs')
   const dir = await ensureDataDir('luts')
   const written = await writeLookLut(preset, dir, { strength })
-  const nodeIndex = Math.max(1, Number(args.nodeIndex) || 1)
-  const targetParams = scope === 'item'
-    ? { source: 'item', ...(args.itemId ? scopeOf(args.itemId) : {}) }
-    : { source: 'timeline' }
-  const set = await settle(
-    callTool(ctx, 'graph', { action: 'set_lut', node_index: nodeIndex, lut_path: written.path, ...targetParams }, signal),
-  )
-  const readback = await settle(
-    callTool(ctx, 'graph', { action: 'get_lut', node_index: nodeIndex, ...targetParams }, signal),
-  )
-  const applied = Boolean(set.ok && set.value?.success !== false)
+
+  /** 在真实节点图里找独立创意风格节点；Node1 是输入还原，永不写入。 */
+  const { chooseStyleNode } = await importFresh('lib/style_node.mjs')
+  const resolveStyleNode = async (itemId) => {
+    const probe = await settle(callTool(ctx, 'timeline_item_color', { action: 'probe_node_graph', max_nodes: 50, ...scopeOf(itemId) }, signal))
+    if (!probe.ok) return { ok: false, error: `读节点图失败：${messageOf(probe.error)}` }
+    const nodes = Array.isArray(probe.value?.nodes) ? probe.value.nodes : []
+    if (!nodes.length) return { ok: false, error: '节点图为空，无法安全定位风格节点' }
+    return {
+      ...chooseStyleNode(nodes, args.nodeIndex),
+      nodeCount: Number(probe.value?.num_nodes) || nodes.length,
+    }
+  }
+
+  const applyOne = async (itemId, itemName) => {
+    const target = await resolveStyleNode(itemId)
+    if (!target.ok) return { itemId, name: itemName, ok: false, refused: true, error: target.error }
+    const targetParams = { source: 'item', ...scopeOf(itemId) }
+    const set = await settle(callTool(ctx, 'graph', { action: 'set_lut', node_index: target.nodeIndex, lut_path: written.path, ...targetParams }, signal))
+    const styleRead = await settle(callTool(ctx, 'graph', { action: 'get_lut', node_index: target.nodeIndex, ...targetParams }, signal))
+    const inputRead = await settle(callTool(ctx, 'graph', { action: 'get_lut', node_index: 1, ...targetParams }, signal))
+    const styleLut = styleRead.ok ? (styleRead.value?.lut ?? styleRead.value ?? null) : null
+    const inputAfter = inputRead.ok ? (inputRead.value?.lut ?? inputRead.value ?? null) : null
+    const styleOk = Boolean(set.ok && set.value?.success !== false && styleLut && String(styleLut).includes(String(written.name ?? path.basename(written.path, '.cube'))))
+    const inputPreserved = String(inputAfter ?? '') === String(target.inputBefore ?? '')
+    return {
+      itemId,
+      name: itemName,
+      ok: styleOk && inputPreserved,
+      nodeIndex: target.nodeIndex,
+      nodeLabel: target.label,
+      nodeCount: target.nodeCount,
+      candidates: target.candidates,
+      lutPath: written.path,
+      lutBytes: written.bytes,
+      setResult: set.value ?? null,
+      setError: set.ok ? null : set.error,
+      styleLut,
+      inputLutBefore: target.inputBefore,
+      inputLutAfter: inputAfter,
+      inputPreserved,
+      styleOk,
+      verified: styleOk && inputPreserved,
+      error: styleOk && inputPreserved ? null : (!styleOk ? '风格 LUT 未挂到独立节点或读回不符' : 'Node1 输入还原 LUT 被改变，拒绝视为成功'),
+    }
+  }
+
+  let items = []
+  if (scope === 'item') {
+    if (!args.itemId) throw new Error('style.apply scope=item 需要 itemId')
+    items = [{ id: args.itemId, name: args.itemId }]
+  } else {
+    items = await listVideoItems(ctx, signal, 1)
+  }
+  if (!items.length) throw new Error('V1 没有片段')
+  const results = []
+  for (const entry of items) results.push(await applyOne(entry.id, entry.name ?? entry.id))
+  const ok = results.every((row) => row.ok)
   return {
-    ok: applied,
+    ok,
     preset,
     scope,
-    nodeIndex,
+    strength,
     lutPath: written.path,
     lutBytes: written.bytes,
-    setResult: set.value ?? null,
-    setError: set.ok ? null : set.error,
-    lutReadback: readback.ok ? readback.value?.lut ?? readback.value : null,
-    verified: Boolean(readback.ok),
-    strength,
-    lutName: written.name ?? null,
-    note: applied
-      ? `${scope === 'timeline' ? '时间线' : '片段'} ${nodeIndex} 号节点已挂上 ${preset} LUT（强度 ${strength}）；用 look.capture 看画面确认`
-      : 'SetLUT 失败：检查 LUT 目录权限与该节点是否可用',
+    nodeIndex: results[0]?.nodeIndex ?? null,
+    styleLut: results[0]?.styleLut ?? null,
+    inputLutBefore: results[0]?.inputLutBefore ?? null,
+    inputLutAfter: results[0]?.inputLutAfter ?? null,
+    inputPreserved: results.every((row) => row.inputPreserved === true),
+    verified: ok,
+    items: results,
+    note: ok
+      ? `${scope === 'timeline' ? '时间线 V1' : '片段'} 已把 ${preset} LUT 写入独立创意节点；Node1 输入还原 LUT 保持不变`
+      : '至少一个片段没有安全写入手动风格节点；见 items，不覆盖 Node1',
   }
 }
 
@@ -5360,7 +5805,7 @@ async function opGradeBuild3(ctx, args, signal) {
     const re = await settle(callTool(ctx, 'graph', { action: 'set_lut', node_index: 1, lut_path: restoreLutPath, source: 'item', ...scopeOf(item.id) }, signal))
     const rr = await settle(callTool(ctx, 'timeline_item_color', { action: 'probe_node_graph', ...scopeOf(item.id) }, signal))
     const node1 = (rr.ok ? rr.value?.nodes ?? [] : []).find((node) => Number(node.node_index) === 1) ?? null
-    restoreReapplied = { ok: Boolean(re.ok && node1?.lut), mountedLut: node1?.lut ?? null, source: preNode1Lut ? 'before-build' : 'args' }
+    restoreReapplied = { ok: Boolean(re.ok && String(node1?.lut ?? '') === String(restoreLutPath)), mountedLut: node1?.lut ?? null, expectedLut: restoreLutPath, source: preNode1Lut ? 'before-build' : 'args' }
   }
   let postMergeSaturation = null
   if (safeSaturation) {
@@ -7319,7 +7764,7 @@ async function opFeedbackIssue(ctx, args, signal) {
     '',
     '### 环境',
     '```json',
-    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.13.3' }, null, 2),
+    JSON.stringify({ platform: deps?.platform ?? process.platform, mcp: deps?.mcp, resolveApp: deps?.resolveApp, binaries: deps?.binaries, pluginVersion: '0.14.0' }, null, 2),
     '```',
     '',
     '### 调试日志（最近）',
@@ -7446,6 +7891,7 @@ const OPS = {
   'input.audit': opInputAudit,
   'raw.apply': opRawApply,
   'vibe.apply': opVibeApply,
+  'vibe.vision': opVibeVision,
   'vibe.run': opVibeRun,
   'overlay.plan': opOverlayPlan,
   'overlay.render': opOverlayRender,

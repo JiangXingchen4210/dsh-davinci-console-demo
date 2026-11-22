@@ -1057,12 +1057,20 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function displayText(value) {
+      if (value === null || value === undefined || value === '') return '—'
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+      if (Array.isArray(value)) return value.map(displayText).join(' / ')
+      if (typeof value === 'object') return value.versionName ?? value.name ?? pretty(value)
+      return String(value)
+    }
+
     function MetaRow({ label, value }) {
       return h(
         'div',
         { style: S.metaRow },
         h('span', { style: S.metaLabel }, label),
-        h('span', { style: S.metaValue }, value ?? '—'),
+        h('span', { style: S.metaValue }, displayText(value)),
       )
     }
 
@@ -1852,7 +1860,7 @@ window.__ModuleLoader__.load({
         }
         const results = []
         for (const entry of items) {
-          const value = await run('style.apply', { preset, scope: 'item', itemId: entry.id, nodeIndex: 1 }, `${preset} · ${entry.name ?? ''}`)
+          const value = await run('style.apply', { preset, scope: 'item', itemId: entry.id }, `${preset} · ${entry.name ?? ''}`)
           results.push({ item: entry.name, ok: Boolean(value?.ok), lut: value?.lutReadback?.lut ?? null })
         }
         setStyleResult({ preset, total: items.length, ok: results.filter((entry) => entry.ok).length, results })
@@ -2019,6 +2027,30 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      const visionDetail = commandResult?.results
+        ? h(
+            'div',
+            { style: { ...S.hint, borderTop: '1px solid var(--dsw-alias-border)', paddingTop: 8, marginTop: 8 } },
+            h('div', { style: S.hint }, `视觉模型：${commandResult.provider ?? '—'} / ${commandResult.model ?? '—'}；阶段：${commandResult.stage ?? '—'}；调用：${(commandResult.callOk ?? commandResult.ok) === true ? '成功' : '失败'}；完整验收：${commandResult.complete === true ? '通过' : '未通过'}${(commandResult.callOk ?? commandResult.ok) === true && commandResult.complete !== true ? '（部分完成 / 未通过）' : ''}`),
+            ...(commandResult.results ?? []).map((row) =>
+              h(
+                'div',
+                { key: row.itemId, style: S.hint },
+                `${row.itemName ?? row.itemId} · 采样 ${(row.frames ?? []).map((frame) => `t=${frame.timeSec}s`).join(' / ') || '—'} · 复看 ${row.review?.verdict ?? (row.review?.skipped ? '未复看' : '失败')}${row.review?.confidence != null ? ` (${row.review.confidence})` : ''} · 模型置信 ${row.analysis?.overallConfidence ?? '—'} · 局部肤色 ${row.localCorrection?.requested ? '未完成' : '不需要'}`,
+              ),
+            ),
+            commandResult.localRequested
+              ? h('div', { style: S.error }, '模型建议局部肤色修正，但本轮没有安全执行；Vibe Color 不视为完整通过。')
+              : null,
+            (commandResult.unverifiedChecks ?? []).length
+              ? h('div', { style: S.hint }, `未验收：${commandResult.unverifiedChecks.join('、')}（本轮没有可靠检测能力）`)
+              : null,
+            (commandResult.verdicts ?? []).map((row) =>
+              h('div', { key: `${row.itemId}-v`, style: S.hint }, `复看结论 ${row.itemId}: ${row.verdict ?? '—'}${row.confidence != null ? ` / ${row.confidence}` : ''}`),
+            ),
+          )
+        : null
+
       const commandBar = h(
         'section',
         {
@@ -2028,7 +2060,7 @@ window.__ModuleLoader__.load({
             background: 'var(--dsw-alias-bg-layer-1)',
           },
         },
-        h('div', { style: S.cardTitle }, t('cmd.title')),
+        h('div', { style: S.cardTitle }, `${t('cmd.title')}（默认调用当前视觉模型；失败不回退词典）`),
         h('textarea', {
           value: commandText,
           placeholder: t('cmd.placeholder'),
@@ -2060,6 +2092,7 @@ window.__ModuleLoader__.load({
                     h('pre', { style: S.pre }, JSON.stringify(commandResult.executed, null, 2).slice(0, 2400)),
                   )
                 : h('div', { style: S.hint }, t('cmd.executedHint')),
+              visionDetail,
             )
           : null,
       )
@@ -2400,7 +2433,7 @@ window.__ModuleLoader__.load({
                 value: okOf(state?.nodes)?.num_nodes ?? '—',
               }),
               h(MetaRow, { label: t('label.comps'), value: okOf(state?.comps)?.count ?? '—' }),
-              h(MetaRow, { label: t('label.version'), value: okOf(state?.version)?.version ?? '—' }),
+              h(MetaRow, { label: t('label.version'), value: okOf(state?.version)?.version?.versionName ?? '—' }),
               h(MetaRow, { label: t('label.group'), value: okOf(state?.colorGroup)?.name ?? '—' }),
               h(MetaRow, {
                 label: t('label.versions'),

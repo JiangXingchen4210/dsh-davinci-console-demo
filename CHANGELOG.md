@@ -1,3 +1,15 @@
+## 0.14.0 — 视觉驱动的 Vibe Color
+
+- **主入口默认视觉模型**：`vibe.apply` / 颜色类 `vibe.run` 先让 DeepSeek-V4.1-Flash 看多个时间点的 Resolve 处理帧，再生成结构化场景、主体、光线、问题与调色建议；视觉调用失败明确返回，不回退关键词词典。
+- **先看画面，再改输入**：输入审计延后到模型判断之后；V-Log 由 CaptureGamma 证据确认，BT.709/未知曲线不套 Log LUT。
+- **技术转换进入主入口**：非 RCM 下 V-Log 先挂 Node1 技术 LUT 并读回；DRX/建图后再次核对 Node1，技术 LUT 丢失即失败。
+- **复看独立 verdict**：before/after 配对时间点交给模型，必须给 `improved / worse / uncertain`；worse/uncertain 不通过。
+- **客观画质**：真实像素统计高光/暗部裁切、单通道溢色、低梯度硬台阶（banding）与跨帧亮度跳变；覆盖全部采样帧。
+- **严格验收语义**：`callOk` 只代表调用成功，`acceptance` 由 `complete` 决定；未通过时 UI 显示“部分完成 / 未通过”，不把模型 improved 当验收。
+- **独立创意节点**：风格 LUT 只写专用风格节点，已有风格可安全替换；Node1 输入 LUT 前后读回校验。
+- **已知边界**：局部肤色跟踪修正尚未可靠打通（当前不暴露为完成能力）；色彩溢出/断层检测为实测启发式，仍需人工复核；A002 车内镜头自然校正审美未通过。
+- **测试**：46/46 pass。
+
 ## 0.13.3 — S5 Gamma 识别与 Vibe 管线保护
 
 - **真实灰片根因修复**：Panasonic 识别改为读取实际 `CaptureGamma`；`CINELIKE_D2 / BT.709` 不再被误判为 V-Log，V-Log 仍按 V-Log 处理
